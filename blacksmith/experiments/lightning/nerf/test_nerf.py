@@ -72,6 +72,8 @@ class EfficientNeRFSystem(LightningModule):
 
         self.loss = loss_dict[config.training.loss]()
 
+        self.batch_size = self.config.data_loading.batch_size
+
         self.in_channels_xyz = 3 + config.model.num_freqs * 2 * 3
         self.in_channels_dir = config.model.in_channels_dir
         self.embedding_xyz = Embedding(3, config.model.num_freqs)
@@ -110,7 +112,32 @@ class EfficientNeRFSystem(LightningModule):
         if config.training.use_forge:
             import forge
 
-            max_input = config.data_loading.batch_size * config.model.coarse.samples
+            self.loss_coarse_op = forge.op.loss.MSELoss(name="mse_loss_coarse")
+            self.loss_fine_op = forge.op.loss.MSELoss(name="mse_loss_fine")
+
+            self.loss_coarse_forge = forge.compile(
+                self.loss_coarse_op,
+                sample_inputs=forge.tensor.to_forge_tensors(
+                    [
+                        torch.randn(self.batch_size, 3).requires_grad_(True),
+                        torch.randn(self.batch_size, 3).requires_grad_(True),
+                    ]
+                ),
+                training=True,
+            )
+
+            self.loss_fine_forge = forge.compile(
+                self.loss_fine_op,
+                sample_inputs=forge.tensor.to_forge_tensors(
+                    [
+                        torch.randn(self.batch_size, 3).requires_grad_(True),
+                        torch.randn(self.batch_size, 3).requires_grad_(True),
+                    ]
+                ),
+                training=True,
+            )
+
+            max_input = self.batch_size * config.model.coarse.samples
             self.nerf_coarse_forge = forge.compile(
                 self.nerf_coarse,
                 sample_inputs=[torch.randn(max_input, self.in_channels_xyz)],
@@ -173,13 +200,12 @@ class EfficientNeRFSystem(LightningModule):
             [self.nerf_coarse_forge, self.nerf_fine_forge] if self.config.training.use_forge else self.framework_models
         )
 
-        batch_size = self.config.data_loading.batch_size
-        for ray_idx in range(0, rays.shape[0], batch_size):
-            rays_chunk = rays[ray_idx : ray_idx + batch_size]
+        for ray_idx in range(0, rays.shape[0], self.batch_size):
+            rays_chunk = rays[ray_idx : ray_idx + self.batch_size]
 
             # Handle partial batches by padding with random rays
             num_rays_in_chunk = len(rays_chunk)
-            num_padding_needed = batch_size - num_rays_in_chunk
+            num_padding_needed = self.batch_size - num_rays_in_chunk
 
             if num_padding_needed > 0:
                 # Select random rays to pad the batch
@@ -230,9 +256,8 @@ class EfficientNeRFSystem(LightningModule):
             self.train_dataset,
             shuffle=True,
             num_workers=8,
-            batch_size=self.config.data_loading.batch_size,
+            batch_size=self.batch_size,
             worker_init_fn=seed_worker,
-            pin_memory=True,
         )
 
     def val_dataloader(self):
@@ -242,7 +267,6 @@ class EfficientNeRFSystem(LightningModule):
             num_workers=4,
             worker_init_fn=seed_worker,
             batch_size=1,
-            pin_memory=True,
         )
 
     def training_step(self, batch: int, batch_idx: int) -> torch.Tensor:
@@ -254,18 +278,62 @@ class EfficientNeRFSystem(LightningModule):
             self.nerf_tree.create_voxels_fine()
         results = self(rays)
 
-        loss_total = loss_rgb = self.loss(results, rgbs)
+        if self.config.training.use_forge:
+            loss_total = 0.0
+            if "rgb_coarse" in results:
+                rgb_coarse = results["rgb_coarse"]
+                rgb_coarse.requires_grad_(True)
+                # pad with zeros to match (batch_size, 3)
+                rgb_coarse = torch.cat(
+                    [rgb_coarse, torch.zeros((abs(self.batch_size - rgb_coarse.shape[0]), 3))], dim=0
+                )
+                results["rgb_coarse"] = rgb_coarse
+                rgbs = torch.cat([rgbs, torch.zeros((abs(self.batch_size - rgbs.shape[0]), 3))], dim=0)
+                loss_coarse = self.loss_coarse_forge(rgb_coarse, rgbs)[0]
+                loss_total += loss_coarse
+            if "rgb_fine" in results:
+                rgb_fine = results["rgb_fine"]
+                rgb_fine.requires_grad_(True)
+                # pad with zeros to match (batch_size, 3)
+                rgb_fine = torch.cat([rgb_fine, torch.zeros((abs(self.batch_size - rgb_fine.shape[0]), 3))], dim=0)
+                results["rgb_fine"] = rgb_fine
+                rgbs = torch.cat([rgbs, torch.zeros((abs(self.batch_size - rgbs.shape[0]), 3))], dim=0)
+                loss_fine = self.loss_fine_forge(rgb_fine, rgbs)[0]
+                loss_total += loss_fine
+            loss_rgb = loss_total
+        else:
+            loss_total = loss_rgb = self.loss(results, rgbs)
         log_training_metrics(self.log, rgbs, results, loss_rgb, loss_total)
 
+        self.results = results
         if self.device.type.startswith("cuda"):
             torch.cuda.empty_cache()
         return loss_total
 
     def backward(self, loss, *args, **kwargs):
-        loss.backward(*args, **kwargs)
         if self.config.training.use_forge:
-            self.nerf_coarse_forge.backward()
-            self.nerf_fine_forge.backward()
+            if "rgb_coarse" in self.results:
+                self.loss_coarse_forge.backward()
+                # do autograd on results of postprocessing
+                # forward pass: input -> neural nets (device) -> postprocessing (host) -> loss (device)
+                # backward pass: loss backward (device) -> autograd of postprocessing (host) -> neural nets (device)
+                torch.autograd.backward(
+                    tensors=[self.results["rgb_coarse"]],
+                    # gradient_outputs contains grads for predictions and for labels, first being predictions
+                    grad_tensors=[-self.loss_coarse_forge.gradient_outputs[0].to_torch()],
+                )
+                self.nerf_coarse_forge.backward()
+            if "rgb_fine" in self.results:
+                self.loss_fine_forge.backward()
+                torch.autograd.backward(
+                    tensors=[self.results["rgb_fine"]],
+                    grad_tensors=[-self.loss_fine_forge.gradient_outputs[0].to_torch()],
+                )
+                self.nerf_fine_forge.backward()
+        else:
+            loss.backward(*args, **kwargs)
+
+        del self.results
         log_gradients(self.log, self.nerf_coarse.sigma, self.nerf_fine.sigma)
 
     def configure_optimizers(self):
