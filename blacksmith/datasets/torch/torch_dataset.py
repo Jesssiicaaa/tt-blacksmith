@@ -12,7 +12,7 @@ from blacksmith.experiments.torch.llama.configs import TrainingConfig
 class BaseDataset(Dataset, ABC):
     """Abstract base class for all PyTorch dataset implementations"""
 
-    def __init__(self, config: TrainingConfig, split: str = "train"):
+    def __init__(self, config: TrainingConfig, split: str = "train", collate_fn=None):
         """
         Args:
             config: Training configuration
@@ -20,11 +20,12 @@ class BaseDataset(Dataset, ABC):
         """
         self.config = config
         self.split = split
+        self.collate_fn = collate_fn
 
-        self._prepare_dataset(split)
+        self._prepare_dataset()
 
     @abstractmethod
-    def _prepare_dataset(self, split: str):
+    def _prepare_dataset(self):
         """Load and prepare the dataset"""
         pass
 
