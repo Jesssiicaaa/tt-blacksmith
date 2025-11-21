@@ -6,7 +6,7 @@ from typing import Dict
 
 from torch.utils.data import DataLoader, Dataset
 
-from blacksmith.experiments.torch.llama.configs import TrainingConfig
+from blacksmith.tools.templates.configs import TrainingConfig
 
 
 class BaseDataset(Dataset, ABC):
@@ -17,6 +17,7 @@ class BaseDataset(Dataset, ABC):
         Args:
             config: Training configuration
             split: Dataset split to use ("train", "validation", "test", etc.)
+            collate_fn: Function to collate samples into batches
         """
         self.config = config
         self.split = split

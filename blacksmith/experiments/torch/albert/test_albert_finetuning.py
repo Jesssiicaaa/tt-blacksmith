@@ -11,8 +11,8 @@ import torch_xla.runtime as xr
 from tqdm import tqdm
 
 from blacksmith.experiments.torch.albert.configs import TrainingConfig
-from blacksmith.datasets.torch.banking77.banking77_dataset import Banking77Dataset
-from blacksmith.models.torch.huggingface.hf_models import get_albert_model
+from blacksmith.datasets.torch.dataset_utils import get_dataset
+from blacksmith.models.torch.huggingface.albert import AlbertWithMLP
 from blacksmith.tools.cli import generate_config
 from blacksmith.tools.reproducibility_manager import ReproducibilityManager
 from blacksmith.tools.logging_manager import TrainingLogger
@@ -63,7 +63,9 @@ def train(config: TrainingConfig, device: torch.device, logger: TrainingLogger, 
     logger.info("Starting training...")
 
     # Load model
-    model = get_albert_model(config, device)
+    model = AlbertWithMLP(config)
+    model.to(eval(config.dtype))
+    model.to(device)
     logger.info(f"Loaded {config.model_name} model.")
     logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
     logger.info(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
@@ -73,11 +75,11 @@ def train(config: TrainingConfig, device: torch.device, logger: TrainingLogger, 
         checkpoint_manager.load_checkpoint()
 
     # Load dataset
-    train_dataset = Banking77Dataset(config=config)
+    train_dataset = get_dataset(config=config, split="train")
     train_dataloader = train_dataset.get_dataloader()
     logger.info(f"Loaded {config.dataset_id} dataset. Train dataset size: {len(train_dataloader)*config.batch_size}")
 
-    eval_dataset = Banking77Dataset(config=config, split="test")
+    eval_dataset = get_dataset(config=config, split="test")
     eval_dataloader = eval_dataset.get_dataloader()
     logger.info(f"Loaded {config.dataset_id} dataset. Eval dataset size: {len(eval_dataloader)*config.batch_size}")
 
