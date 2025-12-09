@@ -82,4 +82,3 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           gh pr merge --squash --auto "${{ steps.create-pr.outputs.pull-request-number }}"
-          gh pr comment ${{ steps.create-pr.outputs.pull-request-number }} --body "$(cat ${{ runner.temp }}/commit_list.txt)"
